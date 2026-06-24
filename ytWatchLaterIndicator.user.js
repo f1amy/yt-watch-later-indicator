@@ -2,7 +2,7 @@
 // @name         YouTube Watch Later Indicator
 // @namespace    https://github.com/f1amy/yt-watch-later-indicator
 // @homepageURL  https://github.com/f1amy/yt-watch-later-indicator
-// @version      1.0.0
+// @version      1.0.1
 // @description  Shows a small badge on any video thumbnail that is already in your Watch Later playlist (home, search, and recommended/up-next).
 // @author       F1amy
 // @downloadURL  https://raw.githubusercontent.com/f1amy/yt-watch-later-indicator/main/ytWatchLaterIndicator.user.js
