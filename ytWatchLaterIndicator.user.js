@@ -38,7 +38,7 @@
 
     // Show the words "Watch Later" next to the clock icon. false = icon only
     // (recommended; stays readable on the tiny sidebar thumbnails).
-    showLabel: true,
+    showLabel: false,
 
     // Also badge Shorts thumbnails (Shorts you've added to Watch Later).
     markShorts: true,
@@ -59,10 +59,13 @@
    * -------------------------------------------------------------------- */
   const ORIGIN = 'https://www.youtube.com';
   const STORE_KEY = 'ytwl_cache';
-  const CLOCK_SVG =
-    '<svg viewBox="0 0 24 24" aria-hidden="true">' +
-    '<path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z"/>' +
-    '<path d="M12.5 7H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>';
+  // SVG built via DOM APIs (not innerHTML) so it works under YouTube's
+  // Trusted Types CSP, which blocks string-to-HTML assignment.
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const CLOCK_PATHS = [
+    'M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z',
+    'M12.5 7H11v6l5.25 3.15.75-1.23-4.5-2.67z',
+  ];
 
   let wlSet = new Set();   // current Watch Later video IDs
   let fetching = false;    // guard against overlapping fetches
@@ -313,39 +316,34 @@
     if (getComputedStyle(a).position === 'static') a.style.position = 'relative';
   }
 
-    function addBadge(a) {
-        if (a.querySelector(':scope > .wl-badge')) return;
-
-        const b = document.createElement('div');
-        b.className = 'wl-badge' + (CONFIG.showLabel ? ' wl-badge--label' : '');
-        b.title = 'In Watch Later';
-
-        const svg = document.createElementNS('http://w3.org', 'svg');
-        svg.setAttribute('viewBox', '0 0 24 24');
-        svg.setAttribute('width', '24');
-        svg.setAttribute('height', '24');
-
-        svg.setAttribute('fill', 'currentColor');
-
-        const path = document.createElementNS('http://w3.org', 'path');
-
-        path.setAttribute('d', 'M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm4.2 14.2L11 13V7h1.5v5.2l4.5 2.7-.8 1.3z');
-
-        svg.appendChild(path);
-        b.appendChild(svg);
-
-        if (CONFIG.showLabel) {
-            const textSpan = document.createElement('span');
-            textSpan.className = 'wl-badge-text';
-            textSpan.textContent = 'Watch Later';
-            b.appendChild(textSpan);
-        }
-
-        a.appendChild(b);
+  function buildClockSvg() {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    for (const d of CLOCK_PATHS) {
+      const p = document.createElementNS(SVG_NS, 'path');
+      p.setAttribute('d', d);
+      svg.appendChild(p);
     }
+    return svg;
+  }
 
+  function addBadge(a) {
+    if (a.querySelector(':scope > .wl-badge')) return;
+    const b = document.createElement('div');
+    b.className = 'wl-badge' + (CONFIG.showLabel ? ' wl-badge--label' : '');
+    b.title = 'In Watch Later';
+    b.appendChild(buildClockSvg());
+    if (CONFIG.showLabel) {
+      const span = document.createElement('span');
+      span.className = 'wl-badge-text';
+      span.textContent = 'Watch Later';
+      b.appendChild(span);
+    }
+    a.appendChild(b);
+  }
 
-    function removeBadge(a) {
+  function removeBadge(a) {
     a.querySelectorAll(':scope > .wl-badge').forEach(n => n.remove());
   }
 
