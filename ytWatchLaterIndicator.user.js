@@ -2,7 +2,7 @@
 // @name         YouTube Watch Later Indicator
 // @namespace    https://github.com/f1amy/yt-watch-later-indicator
 // @homepageURL  https://github.com/f1amy/yt-watch-later-indicator
-// @version      1.0.1
+// @version      1.0.2
 // @description  Shows a small badge on any video thumbnail that is already in your Watch Later playlist (home, search, and recommended/up-next).
 // @author       F1amy
 // @downloadURL  https://raw.githubusercontent.com/f1amy/yt-watch-later-indicator/main/ytWatchLaterIndicator.user.js
@@ -47,6 +47,14 @@
     bgColor: '#0f0f0f',
     fgColor: '#ffffff',
 
+    // Badge background transparency. 0 = fully see-through, 1 = solid.
+    // A blur is applied behind it so the icon stays readable on busy thumbnails.
+    bgOpacity: 0.55,
+
+    // Don't show badges on the Watch Later playlist page itself
+    // (every item there is in WL, so the badges are just noise).
+    hideOnWatchLaterPage: true,
+
     // Internal: how long to wait after DOM changes before re-scanning.
     rescanDebounceMs: 250,
 
@@ -66,6 +74,7 @@
     'M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z',
     'M12.5 7H11v6l5.25 3.15.75-1.23-4.5-2.67z',
   ];
+  const VIDEO_ID_RE = /^[0-9A-Za-z_-]{11}$/;
 
   let wlSet = new Set();   // current Watch Later video IDs
   let fetching = false;    // guard against overlapping fetches
@@ -290,6 +299,89 @@
   }
 
   /* ----------------------------------------------------------------------
+   * Live updates: optimistically reflect Watch Later add/remove the instant
+   * the user does it, by observing the internal playlist-edit API calls.
+   * This is language-independent (it reads the request payload, not UI text),
+   * so it works for the hover "Watch later" button, the Save menu, and the
+   * player's Save button alike. The periodic refetch reconciles afterwards.
+   * -------------------------------------------------------------------- */
+  function applyPlaylistEdit(text) {
+    if (typeof text !== 'string' || !text) return;
+    if (text.indexOf('addedVideoId') === -1 && text.indexOf('removedVideoId') === -1) return;
+
+    let isWL = false;
+    const adds = [];
+    const rems = [];
+
+    let obj = null;
+    try { obj = JSON.parse(text); } catch (e) { obj = null; }
+
+    if (obj) {
+      isWL = obj.playlistId === 'WL';
+      const actions = Array.isArray(obj.actions) ? obj.actions : [];
+      for (const act of actions) {
+        if (act && typeof act.addedVideoId === 'string') adds.push(act.addedVideoId);
+        if (act && typeof act.removedVideoId === 'string') rems.push(act.removedVideoId);
+      }
+      // Some payloads nest the id elsewhere; fall back to a plain string check.
+      if (!isWL && /"playlistId"\s*:\s*"WL"/.test(text)) isWL = true;
+    } else {
+      if (!/"playlistId"\s*:\s*"WL"/.test(text)) return;
+      isWL = true;
+      let m;
+      const addRe = /"addedVideoId"\s*:\s*"([0-9A-Za-z_-]{11})"/g;
+      while ((m = addRe.exec(text))) adds.push(m[1]);
+      const remRe = /"removedVideoId"\s*:\s*"([0-9A-Za-z_-]{11})"/g;
+      while ((m = remRe.exec(text))) rems.push(m[1]);
+    }
+
+    if (!isWL) return;
+
+    let changed = false;
+    for (const id of adds) if (VIDEO_ID_RE.test(id) && !wlSet.has(id)) { wlSet.add(id); changed = true; }
+    for (const id of rems) if (wlSet.delete(id)) changed = true;
+
+    if (changed) {
+      saveCache(wlSet);
+      scheduleMark();
+      log('optimistic WL update; size now', wlSet.size);
+    }
+  }
+
+  function hookPlaylistEdits() {
+    const w = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
+
+    // Hook fetch (YouTube's innertube API uses fetch for playlist edits).
+    try {
+      if (typeof w.fetch === 'function' && !w.fetch.__wlHooked) {
+        const origFetch = w.fetch;
+        const hooked = function (input, init) {
+          try {
+            const body = init && init.body;
+            if (typeof body === 'string') applyPlaylistEdit(body);
+          } catch (e) { /* never break the page's request */ }
+          return origFetch.apply(this, arguments);
+        };
+        hooked.__wlHooked = true;
+        w.fetch = hooked;
+      }
+    } catch (e) { log('fetch hook failed', e); }
+
+    // Hook XHR as a safety net.
+    try {
+      const XHR = w.XMLHttpRequest;
+      if (XHR && XHR.prototype && !XHR.prototype.__wlHooked) {
+        const origSend = XHR.prototype.send;
+        XHR.prototype.send = function (body) {
+          try { if (typeof body === 'string') applyPlaylistEdit(body); } catch (e) {}
+          return origSend.apply(this, arguments);
+        };
+        XHR.prototype.__wlHooked = true;
+      }
+    } catch (e) { log('xhr hook failed', e); }
+  }
+
+  /* ----------------------------------------------------------------------
    * DOM marking
    * -------------------------------------------------------------------- */
   function getVideoId(a) {
@@ -306,9 +398,22 @@
     return null;
   }
 
+  // Channel-avatar links can also point at /watch on some home-page cards, which
+  // caused a duplicate badge to land on the author's avatar. A link is treated
+  // as an avatar (and skipped) when it carries an avatar element but no real
+  // video thumbnail element.
+  function isAvatarAnchor(a) {
+    if (a.closest('#avatar-link, yt-decorated-avatar-view-model, yt-avatar-shape, .yt-spec-avatar-shape')) return true;
+    const hasAvatar = a.querySelector('#avatar, yt-img-shadow#avatar, yt-decorated-avatar-view-model, yt-avatar-shape, .yt-spec-avatar-shape');
+    if (!hasAvatar) return false;
+    const hasThumb = a.querySelector('ytd-thumbnail, yt-thumbnail-view-model, yt-image');
+    return !hasThumb;
+  }
+
   // Only treat anchors that actually contain a thumbnail image as targets,
-  // so we badge the thumbnail and not the title/other text links.
+  // so we badge the thumbnail and not the title/avatar/other links.
   function looksLikeThumbnail(a) {
+    if (isAvatarAnchor(a)) return false;
     return !!a.querySelector('img, yt-image, .yt-core-image, ytd-thumbnail, yt-thumbnail-view-model');
   }
 
@@ -360,7 +465,27 @@
     else { removeBadge(a); }
   }
 
+  // The Watch Later page lists only WL videos, so every badge there is redundant.
+  function isWatchLaterPage() {
+    if (!CONFIG.hideOnWatchLaterPage) return false;
+    try {
+      if (location.pathname !== '/playlist') return false;
+      return new URLSearchParams(location.search).get('list') === 'WL';
+    } catch (e) { return false; }
+  }
+
+  function clearAllBadges() {
+    document.querySelectorAll('.wl-badge').forEach(n => n.remove());
+    document.querySelectorAll('[data-wl-id]').forEach(n => {
+      n.removeAttribute('data-wl-id');
+      n.removeAttribute('data-wl-state');
+    });
+  }
+
   function markAll() {
+    // Suppress badges entirely on the Watch Later playlist page.
+    if (isWatchLaterPage()) { clearAllBadges(); return; }
+
     const sel = CONFIG.markShorts
       ? 'a[href*="/watch?v="], a[href*="/shorts/"]'
       : 'a[href*="/watch?v="]';
@@ -377,6 +502,19 @@
   /* ----------------------------------------------------------------------
    * Styles
    * -------------------------------------------------------------------- */
+  function hexToRgba(hex, alpha) {
+    try {
+      let h = String(hex).trim().replace(/^#/, '');
+      if (h.length === 3) h = h.split('').map(c => c + c).join('');
+      const r = parseInt(h.slice(0, 2), 16);
+      const g = parseInt(h.slice(2, 4), 16);
+      const b = parseInt(h.slice(4, 6), 16);
+      if ([r, g, b].some(Number.isNaN)) return hex;
+      const a = (typeof alpha === 'number' && alpha >= 0 && alpha <= 1) ? alpha : 1;
+      return `rgba(${r},${g},${b},${a})`;
+    } catch (e) { return hex; }
+  }
+
   function injectStyles() {
     const corners = {
       'top-left': 'top:6px;left:6px;',
@@ -385,6 +523,7 @@
       'bottom-right': 'bottom:6px;right:6px;',
     };
     const pos = corners[CONFIG.badgeCorner] || corners['top-left'];
+    const bg = hexToRgba(CONFIG.bgColor, CONFIG.bgOpacity);
     const css =
       '.wl-badge{' +
         'position:absolute;' + pos +
@@ -392,14 +531,17 @@
         'display:inline-flex;align-items:center;gap:4px;' +
         'height:22px;padding:0 5px;box-sizing:border-box;' +
         'border-radius:6px;' +
-        'background:' + CONFIG.bgColor + ';color:' + CONFIG.fgColor + ';' +
+        'background:' + bg + ';color:' + CONFIG.fgColor + ';' +
         'font:500 11px/1 "Roboto","Arial",sans-serif;' +
-        'box-shadow:0 1px 3px rgba(0,0,0,.45);' +
+        'box-shadow:0 1px 3px rgba(0,0,0,.35);' +
+        '-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);' +
         'pointer-events:none;' +
       '}' +
-      '.wl-badge svg{width:15px;height:15px;display:block;fill:' + CONFIG.fgColor + ';}' +
+      // Drop-shadow keeps the white clock readable now that the background is see-through.
+      '.wl-badge svg{width:15px;height:15px;display:block;fill:' + CONFIG.fgColor + ';' +
+        'filter:drop-shadow(0 1px 1.5px rgba(0,0,0,.55));}' +
       '.wl-badge--label{padding:0 7px 0 5px;}' +
-      '.wl-badge-text{white-space:nowrap;}';
+      '.wl-badge-text{white-space:nowrap;text-shadow:0 1px 1.5px rgba(0,0,0,.55);}';
     if (typeof GM_addStyle === 'function') GM_addStyle(css);
     else { const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s); }
   }
@@ -413,16 +555,16 @@
       GM_registerMenuCommand('Clear cached list', () => {
         try { GM_setValue(cacheKey(), ''); } catch (e) {}
         wlSet = new Set();
-        document.querySelectorAll('.wl-badge').forEach(n => n.remove());
-        document.querySelectorAll('[data-wl-id]').forEach(n => {
-          n.removeAttribute('data-wl-id'); n.removeAttribute('data-wl-state');
-        });
+        clearAllBadges();
         scheduleMark();
       });
     } catch (e) { /* menu API unavailable */ }
   }
 
   function init() {
+    // Install the live add/remove hooks as early as possible.
+    hookPlaylistEdits();
+
     injectStyles();
     registerMenu();
     ensureWatchLater(false);
