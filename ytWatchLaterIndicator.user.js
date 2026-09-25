@@ -357,10 +357,32 @@
         const origFetch = w.fetch;
         const hooked = function (input, init) {
           try {
-            console.log(input, init);
             const body = init && init.body;
-            if (typeof body === 'string') { applyPlaylistEdit(body); }
-            else if (typeof body === 'object') { applyPlaylistEdit(JSON.stringify(body)); }
+            if (typeof body === 'string') {
+              applyPlaylistEdit(body);
+            } else if (body instanceof ReadableStream) {
+              const [streamForHook, streamForFetch] = body.tee();
+              init.body = streamForFetch;
+
+              (async () => {
+                try {
+                  const reader = streamForHook.getReader();
+                  const decoder = new TextDecoder();
+                  let chunks = '';
+                  
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks += decoder.decode(value, { stream: true });
+                  }
+                  chunks += decoder.decode();
+                  
+                  applyPlaylistEdit(chunks);
+                } catch (streamErr) {}
+              })();
+            } else if (typeof body === 'object' && body !== null) {
+              applyPlaylistEdit(JSON.stringify(body));
+            }
           } catch (e) { /* never break the page's request */ }
           return origFetch.apply(this, arguments);
         };
@@ -375,7 +397,33 @@
       if (XHR && XHR.prototype && !XHR.prototype.__wlHooked) {
         const origSend = XHR.prototype.send;
         XHR.prototype.send = function (body) {
-          try { if (typeof body === 'string') applyPlaylistEdit(body); } catch (e) {}
+          try {
+            if (typeof body === 'string') {
+              applyPlaylistEdit(body);
+            } else if (body instanceof ReadableStream) {
+              const [streamForHook, streamForFetch] = body.tee();
+              init.body = streamForFetch;
+
+              (async () => {
+                try {
+                  const reader = streamForHook.getReader();
+                  const decoder = new TextDecoder();
+                  let chunks = '';
+                  
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    chunks += decoder.decode(value, { stream: true });
+                  }
+                  chunks += decoder.decode();
+                  
+                  applyPlaylistEdit(chunks);
+                } catch (streamErr) {}
+              })();
+            } else if (typeof body === 'object' && body !== null) {
+              applyPlaylistEdit(JSON.stringify(body));
+            }
+          } catch (e) {}
           return origSend.apply(this, arguments);
         };
         XHR.prototype.__wlHooked = true;
