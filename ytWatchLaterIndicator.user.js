@@ -2,7 +2,7 @@
 // @name         YouTube Watch Later Indicator
 // @namespace    https://github.com/f1amy/yt-watch-later-indicator
 // @homepageURL  https://github.com/f1amy/yt-watch-later-indicator
-// @version      1.0.7
+// @version      1.0.8
 // @description  Shows a small badge on any video thumbnail that is already in your Watch Later playlist (home, search, and recommended/up-next).
 // @author       F1amy
 // @downloadURL  https://raw.githubusercontent.com/f1amy/yt-watch-later-indicator/main/ytWatchLaterIndicator.user.js
@@ -349,6 +349,8 @@
   }
 
   function hookPlaylistEdits() {
+    // DOES NOT WORK. Needs brotli decompression of request stream
+    return;
     const w = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
 
     // Hook fetch (YouTube's innertube API uses fetch for playlist edits).
@@ -357,7 +359,7 @@
         const origFetch = w.fetch;
         const hooked = function (input, init) {
           try {
-            const body = init && init.body;
+            const body = (init && init.body) || (input && input.body);
             if (typeof body === 'string') {
               applyPlaylistEdit(body);
             } else if (body instanceof ReadableStream) {
