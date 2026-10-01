@@ -2,7 +2,7 @@
 // @name         YouTube Watch Later Indicator
 // @namespace    https://github.com/f1amy/yt-watch-later-indicator
 // @homepageURL  https://github.com/f1amy/yt-watch-later-indicator
-// @version      1.0.8
+// @version      1.0.9
 // @description  Shows a small badge on any video thumbnail that is already in your Watch Later playlist (home, search, and recommended/up-next).
 // @author       F1amy
 // @downloadURL  https://raw.githubusercontent.com/f1amy/yt-watch-later-indicator/main/ytWatchLaterIndicator.user.js
@@ -299,11 +299,18 @@
   }
 
   /* ----------------------------------------------------------------------
-   * Live updates: optimistically reflect Watch Later add/remove the instant
-   * the user does it, by observing the internal playlist-edit API calls.
-   * This is language-independent (it reads the request payload, not UI text),
-   * so it works for the hover "Watch later" button, the Save menu, and the
-   * player's Save button alike. The periodic refetch reconciles afterwards.
+   * Live updates: reflect Watch Later add/remove the instant the user does
+   * it, by observing the internal playlist-edit API calls
+   * (/youtubei/v1/browse/edit_playlist). This is language-independent (it
+   * reads the request payload, not UI text), so it works for the hover
+   * "Watch later" button, the Save menu, and the player's Save button alike.
+   *
+   * YouTube compresses the JSON body of these requests: the page hands fetch
+   * a binary body (Uint8Array/Blob) that begins with the gzip signature
+   * 1f 8b. So we take a non-destructive copy of the body, detect the format
+   * from its first bytes, decompress it with the browser's built-in
+   * DecompressionStream, and only then parse it. The change is applied once
+   * YouTube's response comes back OK; the periodic refetch reconciles later.
    * -------------------------------------------------------------------- */
   function applyPlaylistEdit(text) {
     if (typeof text !== 'string' || !text) return;
@@ -348,87 +355,121 @@
     }
   }
 
+  const EDIT_PLAYLIST_RE = /\/youtubei\/v1\/browse\/edit_playlist(?:[?#]|$)/;
+
+  function requestUrlOf(input) {
+    try {
+      if (typeof input === 'string') return input;
+      if (input && typeof input.url === 'string') return input.url;   // Request
+      if (input && typeof input.href === 'string') return input.href; // URL
+    } catch (e) { /* ignore */ }
+    return '';
+  }
+
+  // Identify the encoding from the body's first bytes rather than headers.
+  function sniffCompression(bytes) {
+    if (bytes.length < 2) return null;
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) return 'gzip';
+    // zlib wrapper: CM = 8 (deflate) and the 16-bit header is a multiple of 31
+    if ((bytes[0] & 0x0f) === 8 && ((bytes[0] << 8) | bytes[1]) % 31 === 0) return 'deflate';
+    return null;
+  }
+
+  async function bytesToText(bytes) {
+    const format = sniffCompression(bytes);
+    log('edit_playlist body:', format || 'uncompressed', bytes.length, 'bytes, starts with',
+        [...bytes.slice(0, 4)].map(b => b.toString(16).padStart(2, '0')).join(' '));
+    if (!format) return new TextDecoder().decode(bytes);
+    if (typeof DecompressionStream !== 'function') { log('DecompressionStream not supported'); return null; }
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
+    return new Response(stream).text();
+  }
+
+  // Copy a body into bytes without consuming what the page is about to send.
+  // new Response(x) accepts string / ArrayBuffer / typed array / Blob /
+  // URLSearchParams / FormData and takes its own copy of the data.
+  function bodyToText(body) {
+    return new Response(body).arrayBuffer().then(buf => bytesToText(new Uint8Array(buf)));
+  }
+
+  // Must run BEFORE the real fetch() so a stream body can be split first.
+  // Returns a promise of the decoded body text, or null if there is no body.
+  function captureFetchBody(input, init) {
+    if (init && init.body != null) {
+      let body = init.body;
+      if (typeof body.getReader === 'function') {
+        // ReadableStream: a stream can only be read once, so split it and
+        // give the page its own branch.
+        const [mine, theirs] = body.tee();
+        init.body = theirs;
+        body = mine;
+      }
+      return bodyToText(body);
+    }
+    if (input && typeof input.clone === 'function' && typeof input.url === 'string') {
+      // Request object: read a clone, the original stays untouched for the page.
+      return input.clone().arrayBuffer().then(buf => bytesToText(new Uint8Array(buf)));
+    }
+    return null;
+  }
+
   function hookPlaylistEdits() {
-    // DOES NOT WORK. Needs brotli decompression of request stream
-    return;
     const w = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
 
-    // Hook fetch (YouTube's innertube API uses fetch for playlist edits).
+    // fetch: YouTube's innertube client sends playlist edits this way.
     try {
       if (typeof w.fetch === 'function' && !w.fetch.__wlHooked) {
         const origFetch = w.fetch;
         const hooked = function (input, init) {
+          let bodyText = null;
           try {
-            const body = (init && init.body) || (input && input.body);
-            if (typeof body === 'string') {
-              applyPlaylistEdit(body);
-            } else if (body instanceof ReadableStream) {
-              const [streamForHook, streamForFetch] = body.tee();
-              init.body = streamForFetch;
+            if (EDIT_PLAYLIST_RE.test(requestUrlOf(input))) bodyText = captureFetchBody(input, init);
+          } catch (e) { log('body capture failed', e); }
 
-              (async () => {
-                try {
-                  const reader = streamForHook.getReader();
-                  const decoder = new TextDecoder();
-                  let chunks = '';
-                  
-                  while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    chunks += decoder.decode(value, { stream: true });
-                  }
-                  chunks += decoder.decode();
-                  
-                  applyPlaylistEdit(chunks);
-                } catch (streamErr) {}
-              })();
-            } else if (typeof body === 'object' && body !== null) {
-              applyPlaylistEdit(JSON.stringify(body));
-            }
-          } catch (e) { /* never break the page's request */ }
-          return origFetch.apply(this, arguments);
+          const result = origFetch.apply(this, arguments);
+
+          if (bodyText) {
+            Promise.all([result, bodyText])
+              .then(([res, text]) => {
+                if (res && res.ok && text) applyPlaylistEdit(text);
+                else log('edit_playlist not applied, HTTP', res && res.status);
+              })
+              .catch(e => log('edit_playlist hook error', e));
+          }
+          return result; // the page gets the untouched original promise
         };
         hooked.__wlHooked = true;
         w.fetch = hooked;
       }
     } catch (e) { log('fetch hook failed', e); }
 
-    // Hook XHR as a safety net.
+    // XHR as a safety net.
     try {
-      const XHR = w.XMLHttpRequest;
-      if (XHR && XHR.prototype && !XHR.prototype.__wlHooked) {
-        const origSend = XHR.prototype.send;
-        XHR.prototype.send = function (body) {
+      const proto = w.XMLHttpRequest && w.XMLHttpRequest.prototype;
+      if (proto && !proto.__wlHooked) {
+        const origOpen = proto.open;
+        const origSend = proto.send;
+        proto.open = function (method, url) {
+          try { this.__wlEdit = EDIT_PLAYLIST_RE.test(String(url)); } catch (e) { /* ignore */ }
+          return origOpen.apply(this, arguments);
+        };
+        proto.send = function (body) {
           try {
-            if (typeof body === 'string') {
-              applyPlaylistEdit(body);
-            } else if (body instanceof ReadableStream) {
-              const [streamForHook, streamForFetch] = body.tee();
-              init.body = streamForFetch;
-
-              (async () => {
-                try {
-                  const reader = streamForHook.getReader();
-                  const decoder = new TextDecoder();
-                  let chunks = '';
-                  
-                  while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    chunks += decoder.decode(value, { stream: true });
-                  }
-                  chunks += decoder.decode();
-                  
-                  applyPlaylistEdit(chunks);
-                } catch (streamErr) {}
-              })();
-            } else if (typeof body === 'object' && body !== null) {
-              applyPlaylistEdit(JSON.stringify(body));
+            if (this.__wlEdit && body != null) {
+              const xhr = this;
+              const bodyText = bodyToText(body);
+              bodyText.catch(() => {}); // avoid unhandled rejections if the request never loads
+              xhr.addEventListener('load', () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                  bodyText.then(t => { if (t) applyPlaylistEdit(t); })
+                    .catch(e => log('edit_playlist xhr hook error', e));
+                }
+              });
             }
-          } catch (e) {}
+          } catch (e) { /* never break the page's request */ }
           return origSend.apply(this, arguments);
         };
-        XHR.prototype.__wlHooked = true;
+        proto.__wlHooked = true;
       }
     } catch (e) { log('xhr hook failed', e); }
   }
