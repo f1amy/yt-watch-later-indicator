@@ -2,8 +2,8 @@
 // @name         YouTube Watch Later Indicator
 // @namespace    https://github.com/f1amy/yt-watch-later-indicator
 // @homepageURL  https://github.com/f1amy/yt-watch-later-indicator
-// @version      1.0.9
-// @description  Shows a small badge on any video thumbnail that is already in your Watch Later playlist (home, search, and recommended/up-next).
+// @version      1.2.0
+// @description  Marks thumbnails of videos already in your Watch Later playlist, and brings back a one-click "Watch later" button on thumbnail hover.
 // @author       F1amy
 // @downloadURL  https://raw.githubusercontent.com/f1amy/yt-watch-later-indicator/main/ytWatchLaterIndicator.user.js
 // @updateURL    https://raw.githubusercontent.com/f1amy/yt-watch-later-indicator/main/ytWatchLaterIndicator.user.js
@@ -36,20 +36,25 @@
     // the hover buttons live top-right).
     badgeCorner: 'top-left',
 
-    // Show the words "Watch Later" next to the clock icon. false = icon only
-    // (recommended; stays readable on the tiny sidebar thumbnails).
-    showLabel: false,
+    // Text next to the clock icon:
+    // 'auto'   = only on thumbnails at least `labelMinWidth` px wide (home, search, sidebar)
+    // 'always' | 'never'
+    showLabel: 'auto',
+    labelMinWidth: 240,
 
     // Also badge Shorts thumbnails (Shorts you've added to Watch Later).
     markShorts: true,
 
-    // Badge look
-    bgColor: '#0f0f0f',
-    fgColor: '#ffffff',
+    // A "Watch later" button in the thumbnail's top-right corner on hover, like YouTube
+    // used to have: a clock adds the video, a check mark (already in Watch Later) removes it.
+    // Shown on video thumbnails everywhere except the Watch Later page and Shorts.
+    showButton: true,
 
-    // Badge background transparency. 0 = fully see-through, 1 = solid.
-    // A blur is applied behind it so the icon stays readable on busy thumbnails.
-    bgOpacity: 0.55,
+    // Badge look. The defaults match YouTube's own duration label, with the clock
+    // in YouTube's link blue so it stands out from the other labels.
+    bgColor: 'rgba(0,0,0,.8)',
+    fgColor: '#ffffff',
+    iconColor: '#3ea6ff',
 
     // Don't show badges on the Watch Later playlist page itself
     // (every item there is in WL, so the badges are just noise).
@@ -65,6 +70,7 @@
   /* ----------------------------------------------------------------------
    * Constants / state
    * -------------------------------------------------------------------- */
+  const W = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
   const ORIGIN = 'https://www.youtube.com';
   const STORE_KEY = 'ytwl_cache';
   // SVG built via DOM APIs (not innerHTML) so it works under YouTube's
@@ -74,11 +80,25 @@
     'M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8z',
     'M12.5 7H11v6l5.25 3.15.75-1.23-4.5-2.67z',
   ];
+  const CHECK_PATH = 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z';
+  // [badge label / "add" button tooltip, "remove" button tooltip]
+  const LABELS = {
+    en: ['Watch later', 'Remove from Watch later'],
+    ru: ['Смотреть позже', 'Удалить из «Смотреть позже»'],
+    uk: ['Переглянути пізніше', 'Видалити з «Переглянути пізніше»'],
+    de: ['Später ansehen', 'Aus „Später ansehen“ entfernen'],
+  };
   const VIDEO_ID_RE = /^[0-9A-Za-z_-]{11}$/;
+  // Cards on which hovering starts YouTube's inline preview, whose mute/CC buttons take the
+  // top-right corner: the button sits left of them there.
+  const PREVIEW_CARDS = 'ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer';
+  const CARDS = PREVIEW_CARDS + ', yt-lockup-view-model, ytd-compact-video-renderer, ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer';
 
-  let wlSet = new Set();   // current Watch Later video IDs
-  let fetching = false;    // guard against overlapping fetches
-  let markTimer = null;    // debounce handle
+  let wlSet = new Set();     // current Watch Later video IDs
+  let entryIds = new Map();  // playlist entry id (setVideoId) -> video id, to resolve removals made on the WL page
+  let fetching = null;       // promise of the running fetch, so a forced refresh can wait for it
+  let markTimer = null;      // debounce handle
+  let editsSent = 0;         // edit_playlist requests seen leaving the page (to tell if YouTube acted on a click)
 
   const log = (...a) => CONFIG.debug && console.log('[WL-Indicator]', ...a);
 
@@ -87,8 +107,7 @@
    * -------------------------------------------------------------------- */
   function ytcfgGet(key) {
     try {
-      const w = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
-      if (w.ytcfg && typeof w.ytcfg.get === 'function') return w.ytcfg.get(key);
+      if (W.ytcfg && typeof W.ytcfg.get === 'function') return W.ytcfg.get(key);
     } catch (e) { /* ignore */ }
     return undefined;
   }
@@ -118,7 +137,7 @@
   }
 
   function defaultContext() {
-    return { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00', hl: 'en', gl: 'US' } };
+    return { client: { clientName: 'WEB', clientVersion: '2.20261001.00.00', hl: 'en', gl: 'US' } };
   }
 
   /* ----------------------------------------------------------------------
@@ -157,22 +176,19 @@
     return null;
   }
 
-  // Recursively collect video IDs from any YouTube response shape.
-  function extractVideoIds(root) {
-    const ids = [];
+  // Recursively collect playlist entries ({ videoId, setVideoId }) from any YouTube response shape.
+  function extractEntries(root) {
+    const out = [];
     (function walk(n) {
       if (!n || typeof n !== 'object') return;
       if (Array.isArray(n)) { for (const x of n) walk(x); return; }
-      if (n.playlistVideoRenderer && n.playlistVideoRenderer.videoId) {
-        ids.push(n.playlistVideoRenderer.videoId);
-      }
-      if (n.lockupViewModel && n.lockupViewModel.contentId &&
-          n.lockupViewModel.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO') {
-        ids.push(n.lockupViewModel.contentId);
-      }
+      const pv = n.playlistVideoRenderer;
+      if (pv && pv.videoId) out.push({ videoId: pv.videoId, setVideoId: pv.setVideoId });
+      const lv = n.lockupViewModel;
+      if (lv && lv.contentId && lv.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO') out.push({ videoId: lv.contentId });
       for (const k in n) walk(n[k]);
     })(root);
-    return ids;
+    return out;
   }
 
   function extractContinuation(root) {
@@ -190,10 +206,11 @@
     return token;
   }
 
-  async function browse(extra) {
+  // POST to an internal YouTube API endpoint ('browse', 'browse/edit_playlist', ...).
+  async function innertube(endpoint, extra) {
     const apiKey = ytcfgGet('INNERTUBE_API_KEY');
     const context = ytcfgGet('INNERTUBE_CONTEXT') || defaultContext();
-    const url = `${ORIGIN}/youtubei/v1/browse?prettyPrint=false${apiKey ? `&key=${apiKey}` : ''}`;
+    const url = `${ORIGIN}/youtubei/v1/${endpoint}?prettyPrint=false${apiKey ? `&key=${apiKey}` : ''}`;
     const headers = { 'Content-Type': 'application/json', 'X-Origin': ORIGIN, 'X-Goog-AuthUser': '0' };
     try {
       const auth = await sapisidAuthHeader();
@@ -209,12 +226,20 @@
       headers,
       body: JSON.stringify(Object.assign({ context }, extra)),
     });
-    if (!res.ok) { log('browse HTTP', res.status); return null; }
+    if (!res.ok) { log(endpoint, 'HTTP', res.status); return null; }
     return res.json();
   }
 
   async function fetchWatchLater() {
     const ids = new Set();
+    const entries = new Map();
+    const take = (data) => {
+      for (const e of extractEntries(data)) {
+        ids.add(e.videoId);
+        if (e.setVideoId) entries.set(e.setVideoId, e.videoId);
+      }
+      return extractContinuation(data);
+    };
     let token = null;
 
     // 1) First page from rendered HTML (reliable auth via cookies).
@@ -222,33 +247,29 @@
       const res = await fetch(`${ORIGIN}/playlist?list=WL&hl=en`, { credentials: 'include' });
       if (res.ok) {
         const data = extractInitialData(await res.text());
-        if (data) {
-          extractVideoIds(data).forEach(id => ids.add(id));
-          token = extractContinuation(data);
-        }
+        if (data) token = take(data);
       }
     } catch (e) { log('html fetch error', e); }
 
     // Fallback: if HTML gave us nothing, try the internal browse endpoint.
     if (ids.size === 0 && !token) {
-      const data = await browse({ browseId: 'VLWL' });
-      if (data) { extractVideoIds(data).forEach(id => ids.add(id)); token = extractContinuation(data); }
+      const data = await innertube('browse', { browseId: 'VLWL' });
+      if (data) token = take(data);
     }
 
     // 2) Remaining pages via continuations.
     let page = 0;
     while (token && page < 300) {
-      const data = await browse({ continuation: token });
+      const data = await innertube('browse', { continuation: token });
       if (!data) break;
       const before = ids.size;
-      extractVideoIds(data).forEach(id => ids.add(id));
-      token = extractContinuation(data);
+      token = take(data);
       page++;
       if (ids.size === before && !token) break;
     }
 
     log('fetched', ids.size, 'Watch Later videos');
-    return ids;
+    return { ids, entries };
   }
 
   /* ----------------------------------------------------------------------
@@ -262,40 +283,51 @@
     try { const raw = GM_getValue(cacheKey()); return raw ? JSON.parse(raw) : null; }
     catch (e) { return null; }
   }
-  function saveCache(set) {
-    try { GM_setValue(cacheKey(), JSON.stringify({ ts: Date.now(), ids: [...set] })); }
-    catch (e) { /* ignore */ }
+  function saveCache(ts) {
+    try {
+      const prev = loadCache();
+      GM_setValue(cacheKey(), JSON.stringify({
+        ts: ts || (prev && prev.ts) || Date.now(), // a live edit doesn't make the whole list fresh
+        ids: [...wlSet],
+        entries: [...entryIds],
+      }));
+    } catch (e) { /* ignore */ }
   }
 
-  async function ensureWatchLater(force) {
-    if (fetching) return;
+  function ensureWatchLater(force) {
+    // A forced refresh asked for while a fetch is running runs right after it.
+    if (fetching) return force ? fetching.then(() => ensureWatchLater(true)) : fetching;
 
     const cached = loadCache();
     if (cached && Array.isArray(cached.ids)) {
       wlSet = new Set(cached.ids);
+      entryIds = new Map(Array.isArray(cached.entries) ? cached.entries : []);
       scheduleMark();
     }
     const fresh = cached && (Date.now() - cached.ts) < CONFIG.cacheTtlMinutes * 60000;
-    if (!force && fresh) return;
+    if (!force && fresh) return Promise.resolve();
 
-    fetching = true;
-    try {
-      const ids = await fetchWatchLater();
-      const prevCount = cached && cached.ids ? cached.ids.length : 0;
-      // Don't wipe a good cache if a background fetch returned empty (likely transient),
-      // unless the refresh was explicitly forced from the menu.
-      if (ids.size === 0 && prevCount > 0 && !force) {
-        log('fetched 0 items, keeping previous cache');
-      } else {
-        wlSet = ids;
-        saveCache(ids);
-        scheduleMark();
+    fetching = (async () => {
+      try {
+        const { ids, entries } = await fetchWatchLater();
+        const prevCount = cached && cached.ids ? cached.ids.length : 0;
+        // Don't wipe a good cache if a background fetch returned empty (likely transient),
+        // unless the refresh was explicitly forced from the menu.
+        if (ids.size === 0 && prevCount > 0 && !force) {
+          log('fetched 0 items, keeping previous cache');
+        } else {
+          wlSet = ids;
+          entryIds = entries;
+          saveCache(Date.now());
+          scheduleMark();
+        }
+      } catch (e) {
+        log('fetch failed', e);
+      } finally {
+        fetching = null;
       }
-    } catch (e) {
-      log('fetch failed', e);
-    } finally {
-      fetching = false;
-    }
+    })();
+    return fetching;
   }
 
   /* ----------------------------------------------------------------------
@@ -303,7 +335,8 @@
    * it, by observing the internal playlist-edit API calls
    * (/youtubei/v1/browse/edit_playlist). This is language-independent (it
    * reads the request payload, not UI text), so it works for the hover
-   * "Watch later" button, the Save menu, and the player's Save button alike.
+   * "Watch later" button, the Save menu, the player's Save button and the
+   * Watch Later page's own "Remove" alike.
    *
    * YouTube compresses the JSON body of these requests: the page hands fetch
    * a binary body (Uint8Array/Blob) that begins with the gzip signature
@@ -311,48 +344,52 @@
    * from its first bytes, decompress it with the browser's built-in
    * DecompressionStream, and only then parse it. The change is applied once
    * YouTube's response comes back OK; the periodic refetch reconciles later.
+   *
+   * Actions seen (Oct 2026):
+   *   ACTION_ADD_VIDEO                { addedVideoId }   hover button / Save menu
+   *   ACTION_REMOVE_VIDEO_BY_VIDEO_ID { removedVideoId } hover button / Save menu
+   *   ACTION_REMOVE_VIDEO             { setVideoId }     "Remove" on the WL page (entry id only)
    * -------------------------------------------------------------------- */
-  function applyPlaylistEdit(text) {
+  function applyPlaylistEdit(text, responseJson) {
     if (typeof text !== 'string' || !text) return;
-    if (text.indexOf('addedVideoId') === -1 && text.indexOf('removedVideoId') === -1) return;
+    let req = null;
+    try { req = JSON.parse(text); } catch (e) { return; }
+    if (!req || req.playlistId !== 'WL' || !Array.isArray(req.actions)) return;
 
-    let isWL = false;
-    const adds = [];
-    const rems = [];
+    // The reply to an add lists the new entry's setVideoId: remember it, so removing that
+    // entry from the WL page later can be resolved without a refetch.
+    for (const e of extractAddedEntries(responseJson)) entryIds.set(e.setVideoId, e.videoId);
 
-    let obj = null;
-    try { obj = JSON.parse(text); } catch (e) { obj = null; }
-
-    if (obj) {
-      isWL = obj.playlistId === 'WL';
-      const actions = Array.isArray(obj.actions) ? obj.actions : [];
-      for (const act of actions) {
-        if (act && typeof act.addedVideoId === 'string') adds.push(act.addedVideoId);
-        if (act && typeof act.removedVideoId === 'string') rems.push(act.removedVideoId);
+    let changed = false, unresolved = false;
+    for (const act of req.actions) {
+      if (!act) continue;
+      if (typeof act.addedVideoId === 'string' && VIDEO_ID_RE.test(act.addedVideoId) && !wlSet.has(act.addedVideoId)) {
+        wlSet.add(act.addedVideoId); changed = true;
       }
-      // Some payloads nest the id elsewhere; fall back to a plain string check.
-      if (!isWL && /"playlistId"\s*:\s*"WL"/.test(text)) isWL = true;
-    } else {
-      if (!/"playlistId"\s*:\s*"WL"/.test(text)) return;
-      isWL = true;
-      let m;
-      const addRe = /"addedVideoId"\s*:\s*"([0-9A-Za-z_-]{11})"/g;
-      while ((m = addRe.exec(text))) adds.push(m[1]);
-      const remRe = /"removedVideoId"\s*:\s*"([0-9A-Za-z_-]{11})"/g;
-      while ((m = remRe.exec(text))) rems.push(m[1]);
+      if (typeof act.removedVideoId === 'string' && wlSet.delete(act.removedVideoId)) changed = true;
+      if (act.action === 'ACTION_REMOVE_VIDEO' && typeof act.setVideoId === 'string') {
+        const id = entryIds.get(act.setVideoId);
+        entryIds.delete(act.setVideoId);
+        if (id) { if (wlSet.delete(id)) changed = true; }
+        else unresolved = true;
+      }
     }
-
-    if (!isWL) return;
-
-    let changed = false;
-    for (const id of adds) if (VIDEO_ID_RE.test(id) && !wlSet.has(id)) { wlSet.add(id); changed = true; }
-    for (const id of rems) if (wlSet.delete(id)) changed = true;
 
     if (changed) {
-      saveCache(wlSet);
+      saveCache();
       markAll();
-      log('optimistic WL update; size now', wlSet.size);
+      log('live WL update; size now', wlSet.size);
     }
+    // An entry we don't know (added in another tab or device): just refetch the list.
+    if (unresolved) { log('unknown WL entry removed, refetching'); ensureWatchLater(true); }
+  }
+
+  // { playlistEditResults: [{ playlistEditVideoAddedResultData: { videoId, setVideoId } }] }
+  function extractAddedEntries(res) {
+    const results = (res && Array.isArray(res.playlistEditResults)) ? res.playlistEditResults : [];
+    return results
+      .map(r => r && r.playlistEditVideoAddedResultData)
+      .filter(d => d && typeof d.videoId === 'string' && typeof d.setVideoId === 'string');
   }
 
   const EDIT_PLAYLIST_RE = /\/youtubei\/v1\/browse\/edit_playlist(?:[?#]|$)/;
@@ -377,8 +414,7 @@
 
   async function bytesToText(bytes) {
     const format = sniffCompression(bytes);
-    log('edit_playlist body:', format || 'uncompressed', bytes.length, 'bytes, starts with',
-        [...bytes.slice(0, 4)].map(b => b.toString(16).padStart(2, '0')).join(' '));
+    log('edit_playlist body:', format || 'uncompressed', bytes.length, 'bytes');
     if (!format) return new TextDecoder().decode(bytes);
     if (typeof DecompressionStream !== 'function') { log('DecompressionStream not supported'); return null; }
     const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format));
@@ -414,38 +450,39 @@
   }
 
   function hookPlaylistEdits() {
-    const w = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
-
     // fetch: YouTube's innertube client sends playlist edits this way.
     try {
-      if (typeof w.fetch === 'function' && !w.fetch.__wlHooked) {
-        const origFetch = w.fetch;
+      if (typeof W.fetch === 'function' && !W.fetch.__wlHooked) {
+        const origFetch = W.fetch;
         const hooked = function (input, init) {
           let bodyText = null;
           try {
-            if (EDIT_PLAYLIST_RE.test(requestUrlOf(input))) bodyText = captureFetchBody(input, init);
+            if (EDIT_PLAYLIST_RE.test(requestUrlOf(input))) { editsSent++; bodyText = captureFetchBody(input, init); }
           } catch (e) { log('body capture failed', e); }
 
           const result = origFetch.apply(this, arguments);
 
           if (bodyText) {
-            Promise.all([result, bodyText])
+            // Clone the response the moment it arrives: this callback is registered before the
+            // page's own, so it runs first, before YouTube reads (and locks) the body.
+            const copy = result.then(res => res.clone());
+            Promise.all([copy, bodyText])
               .then(([res, text]) => {
-                if (res && res.ok && text) applyPlaylistEdit(text);
-                else log('edit_playlist not applied, HTTP', res && res.status);
+                if (!res || !res.ok || !text) { log('edit_playlist not applied, HTTP', res && res.status); return; }
+                return res.json().catch(() => null).then(json => applyPlaylistEdit(text, json));
               })
               .catch(e => log('edit_playlist hook error', e));
           }
           return result; // the page gets the untouched original promise
         };
         hooked.__wlHooked = true;
-        w.fetch = hooked;
+        W.fetch = hooked;
       }
     } catch (e) { log('fetch hook failed', e); }
 
     // XHR as a safety net.
     try {
-      const proto = w.XMLHttpRequest && w.XMLHttpRequest.prototype;
+      const proto = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
       if (proto && !proto.__wlHooked) {
         const origOpen = proto.open;
         const origSend = proto.send;
@@ -455,13 +492,16 @@
         };
         proto.send = function (body) {
           try {
+            if (this.__wlEdit) editsSent++;
             if (this.__wlEdit && body != null) {
               const xhr = this;
               const bodyText = bodyToText(body);
               bodyText.catch(() => {}); // avoid unhandled rejections if the request never loads
               xhr.addEventListener('load', () => {
                 if (xhr.status >= 200 && xhr.status < 300) {
-                  bodyText.then(t => { if (t) applyPlaylistEdit(t); })
+                  let json = null;
+                  try { json = JSON.parse(xhr.responseText); } catch (e) { /* not JSON */ }
+                  bodyText.then(t => { if (t) applyPlaylistEdit(t, json); })
                     .catch(e => log('edit_playlist xhr hook error', e));
                 }
               });
@@ -477,8 +517,7 @@
   /* ----------------------------------------------------------------------
    * DOM marking
    * -------------------------------------------------------------------- */
-  function getVideoId(a) {
-    const href = a.getAttribute('href');
+  function getVideoId(href) {
     if (!href) return null;
     try {
       const u = new URL(href, ORIGIN);
@@ -503,27 +542,26 @@
     return !hasThumb;
   }
 
-  function isViewModelTitle(a) {
-    return a.classList.contains('ytLockupMetadataViewModelTitle');
-  }
-
   // Only treat anchors that actually contain a thumbnail image as targets,
   // so we badge the thumbnail and not the title/avatar/other links.
   function looksLikeThumbnail(a) {
+    if (a.classList.contains('ytLockupMetadataViewModelTitle')) return false;
+    // Chapter ("key moments") thumbnails in search results link to the same video.
+    if (a.closest('ytd-macro-markers-list-item-renderer')) return false;
     if (isAvatarAnchor(a)) return false;
-    if (isViewModelTitle(a)) return false;
     return !!a.querySelector('img, yt-image, .yt-core-image, ytd-thumbnail, yt-thumbnail-view-model');
   }
 
-  function ensurePositioned(a) {
-    if (getComputedStyle(a).position === 'static') a.style.position = 'relative';
+  function labels() {
+    const lang = (document.documentElement.lang || 'en').toLowerCase().split('-')[0];
+    return LABELS[lang] || LABELS.en;
   }
 
-  function buildClockSvg() {
+  function buildSvg(paths) {
     const svg = document.createElementNS(SVG_NS, 'svg');
     svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('aria-hidden', 'true');
-    for (const d of CLOCK_PATHS) {
+    for (const d of paths) {
       const p = document.createElementNS(SVG_NS, 'path');
       p.setAttribute('d', d);
       svg.appendChild(p);
@@ -531,64 +569,162 @@
     return svg;
   }
 
-  function addBadge(a) {
-    if (a.querySelector(':scope > .wl-badge')) return;
+  function buildBadge() {
     const b = document.createElement('div');
-    b.className = 'wl-badge' + (CONFIG.showLabel ? ' wl-badge--label' : '');
+    b.className = 'wl-badge';
     b.title = 'In Watch Later';
-    b.appendChild(buildClockSvg());
-    if (CONFIG.showLabel) {
+    b.appendChild(buildSvg(CLOCK_PATHS));
+    if (CONFIG.showLabel !== 'never') {
       const span = document.createElement('span');
       span.className = 'wl-badge-text';
-      span.textContent = 'Watch Later';
+      span.textContent = labels()[0];
       b.appendChild(span);
     }
-    a.appendChild(b);
+    return b;
   }
 
-  function removeBadge(a) {
-    a.querySelectorAll(':scope > .wl-badge').forEach(n => n.remove());
+  function badgeOf(a) { return a.querySelector(':scope > .wl-badge'); }
+
+  // Label only where the thumbnail is wide enough to carry it (re-checked on each scan,
+  // so it follows window resizes). Thumbnails that aren't laid out yet keep their state.
+  function sizeBadge(a, b) {
+    if (CONFIG.showLabel !== 'auto') return;
+    const w = a.getBoundingClientRect().width;
+    if (w > 0) b.classList.toggle('wl-badge--icon', w < CONFIG.labelMinWidth);
+  }
+
+  /* ----------------------------------------------------------------------
+   * "Watch later" hover button
+   *   Clicking runs YouTube's own playlist-edit command (the one its menus use), so YouTube
+   *   shows its usual "Saved to Watch later" toast with Undo, and the edit hook above updates
+   *   the badge. If YouTube doesn't act on the command, the edit is sent directly instead.
+   * -------------------------------------------------------------------- */
+  function editCommand(videoId, add) {
+    const action = add ? { addedVideoId: videoId, action: 'ACTION_ADD_VIDEO' }
+                       : { removedVideoId: videoId, action: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID' };
+    return {
+      commandMetadata: { webCommandMetadata: { sendPost: true, apiUrl: '/youtubei/v1/browse/edit_playlist' } },
+      playlistEditEndpoint: { playlistId: 'WL', actions: [action] },
+    };
+  }
+
+  async function toggleWatchLater(btn, videoId) {
+    const add = !wlSet.has(videoId);
+    btn.classList.add('wl-btn--busy');
+    try {
+      const before = editsSent;
+      const cmd = editCommand(videoId, add);
+      btn.dispatchEvent(new CustomEvent('yt-action', {
+        bubbles: true, composed: true,
+        detail: { actionName: 'yt-service-request', args: [btn, cmd], optionalAction: false, returnValue: [] },
+      }));
+      await new Promise(r => setTimeout(r, 1500));
+      if (editsSent === before) {
+        log('YouTube ignored the command, sending the edit directly');
+        const body = cmd.playlistEditEndpoint;
+        const json = await innertube('browse/edit_playlist', body);
+        if (json) applyPlaylistEdit(JSON.stringify(body), json);
+      }
+      // The badge/button update when the edit's reply is applied; give it a moment.
+      const t0 = Date.now();
+      while (wlSet.has(videoId) !== add && Date.now() - t0 < 8000) await new Promise(r => setTimeout(r, 100));
+    } catch (e) {
+      log('toggle failed', e);
+    } finally {
+      btn.classList.remove('wl-btn--busy');
+    }
+  }
+
+  function buildButton() {
+    const b = document.createElement('button');
+    b.className = 'wl-btn';
+    b.type = 'button';
+    const add = buildSvg(CLOCK_PATHS); add.classList.add('wl-btn-add');
+    const on = buildSvg([CHECK_PATH]); on.classList.add('wl-btn-on');
+    b.append(add, on);
+    // The button lives inside the thumbnail link: keep clicks from opening the video.
+    for (const type of ['mousedown', 'pointerdown', 'mouseup', 'pointerup']) b.addEventListener(type, e => e.stopPropagation());
+    b.addEventListener('click', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      const id = b.dataset.videoId;
+      if (id && !b.classList.contains('wl-btn--busy')) toggleWatchLater(b, id);
+    });
+    return b;
+  }
+
+  function updateButton(a, id, inWL) {
+    let b = a.querySelector(':scope > .wl-btn');
+    if (!b) {
+      b = buildButton();
+      // The inline preview (ytd-video-preview) is one player YouTube moves over the hovered card;
+      // in search results it covers the card's own button, so its link gets a button too.
+      if (a.closest(PREVIEW_CARDS + ', ytd-video-preview')) b.classList.add('wl-btn--preview');
+      a.appendChild(b);
+    }
+    b.dataset.videoId = id;
+    b.classList.toggle('wl-btn--on', inWL);
+    const [addLabel, removeLabel] = labels();
+    b.title = inWL ? removeLabel : addLabel;
+    b.setAttribute('aria-label', b.title);
+    const w = a.getBoundingClientRect().width;
+    if (w > 0) b.classList.toggle('wl-btn--sm', w < CONFIG.labelMinWidth);
+  }
+
+  // Buttons go on regular videos only (Shorts and the WL page itself are skipped).
+  function wantsButton(href) {
+    return CONFIG.showButton && !onWatchLaterPage() && /^\/watch\?/.test(href || '');
   }
 
   function processAnchor(a) {
-    const id = getVideoId(a);
-    if (!id) { removeBadge(a); a.removeAttribute('data-wl-id'); return; }
-    const desired = wlSet.has(id);
-    // Reconcile only when something changed (handles DOM nodes YouTube recycles
-    // for new videos as you scroll).
-    if (a.dataset.wlId === id && a.dataset.wlState === (desired ? '1' : '0')) return;
-    a.dataset.wlId = id;
+    const href = a.getAttribute('href');
+    const id = getVideoId(href);
+    const desired = !!id && wlSet.has(id);
+    const button = !!id && wantsButton(href);
+    // Fast path: same link, same state as last time (YouTube recycles nodes as you
+    // scroll, which changes the href, so that's what's compared).
+    if (a.dataset.wlHref === href && a.dataset.wlState === (desired ? '1' : '0')) {
+      const b = desired && badgeOf(a);
+      if (b) sizeBadge(a, b);
+      if (!desired || b) return;
+    }
+    a.dataset.wlHref = href || '';
     a.dataset.wlState = desired ? '1' : '0';
-    if (desired) { ensurePositioned(a); addBadge(a); }
-    else { removeBadge(a); }
+    if ((desired || button) && getComputedStyle(a).position === 'static') a.style.position = 'relative';
+    if (desired && !hideBadges()) {
+      let b = badgeOf(a);
+      if (!b) { b = buildBadge(); a.appendChild(b); }
+      sizeBadge(a, b);
+    } else {
+      const b = badgeOf(a);
+      if (b) b.remove();
+    }
+    if (button) updateButton(a, id, desired);
+    else { const b = a.querySelector(':scope > .wl-btn'); if (b) b.remove(); }
   }
 
-  // The Watch Later page lists only WL videos, so every badge there is redundant.
-  function isWatchLaterPage() {
-    if (!CONFIG.hideOnWatchLaterPage) return false;
-    try {
-      if (location.pathname !== '/playlist') return false;
-      return new URLSearchParams(location.search).get('list') === 'WL';
-    } catch (e) { return false; }
+  function onWatchLaterPage() {
+    return location.pathname === '/playlist' && new URLSearchParams(location.search).get('list') === 'WL';
   }
+  // The Watch Later page lists only WL videos, so every badge there is redundant.
+  function hideBadges() { return CONFIG.hideOnWatchLaterPage && onWatchLaterPage(); }
 
   function clearAllBadges() {
-    document.querySelectorAll('.wl-badge').forEach(n => n.remove());
-    document.querySelectorAll('[data-wl-id]').forEach(n => {
-      n.removeAttribute('data-wl-id');
+    document.querySelectorAll('.wl-badge, .wl-btn').forEach(n => n.remove());
+    document.querySelectorAll('[data-wl-href]').forEach(n => {
+      n.removeAttribute('data-wl-href');
       n.removeAttribute('data-wl-state');
     });
   }
 
-  function markAll() {
-    // Suppress badges entirely on the Watch Later playlist page.
-    if (isWatchLaterPage()) { clearAllBadges(); return; }
+  const ANCHOR_SEL = CONFIG.markShorts ? 'a[href*="/watch?v="], a[href*="/shorts/"]' : 'a[href*="/watch?v="]';
 
-    const sel = CONFIG.markShorts
-      ? 'a[href*="/watch?v="], a[href*="/shorts/"]'
-      : 'a[href*="/watch?v="]';
-    document.querySelectorAll(sel).forEach(a => {
-      if (looksLikeThumbnail(a)) processAnchor(a);
+  function markAll() {
+    // Nothing to add on the Watch Later page (unless badges are wanted there).
+    if (onWatchLaterPage() && hideBadges()) { clearAllBadges(); return; }
+    document.querySelectorAll(ANCHOR_SEL).forEach(a => {
+      // Anchors already classified skip the (costlier) thumbnail check.
+      if ('wlHref' in a.dataset || looksLikeThumbnail(a)) processAnchor(a);
     });
   }
 
@@ -600,46 +736,52 @@
   /* ----------------------------------------------------------------------
    * Styles
    * -------------------------------------------------------------------- */
-  function hexToRgba(hex, alpha) {
-    try {
-      let h = String(hex).trim().replace(/^#/, '');
-      if (h.length === 3) h = h.split('').map(c => c + c).join('');
-      const r = parseInt(h.slice(0, 2), 16);
-      const g = parseInt(h.slice(2, 4), 16);
-      const b = parseInt(h.slice(4, 6), 16);
-      if ([r, g, b].some(Number.isNaN)) return hex;
-      const a = (typeof alpha === 'number' && alpha >= 0 && alpha <= 1) ? alpha : 1;
-      return `rgba(${r},${g},${b},${a})`;
-    } catch (e) { return hex; }
-  }
-
   function injectStyles() {
     const corners = {
-      'top-left': 'top:6px;left:6px;',
-      'top-right': 'top:6px;right:6px;',
-      'bottom-left': 'bottom:6px;left:6px;',
-      'bottom-right': 'bottom:6px;right:6px;',
+      'top-left': 'top:8px;left:8px;',
+      'top-right': 'top:8px;right:8px;',
+      'bottom-left': 'bottom:8px;left:8px;',
+      'bottom-right': 'bottom:8px;right:8px;',
     };
     const pos = corners[CONFIG.badgeCorner] || corners['top-left'];
-    const bg = hexToRgba(CONFIG.bgColor, CONFIG.bgOpacity);
     const css =
       '.wl-badge{' +
         'position:absolute;' + pos +
         'z-index:60;' +
         'display:inline-flex;align-items:center;gap:4px;' +
-        'height:22px;padding:0 5px;box-sizing:border-box;' +
-        'border-radius:6px;' +
-        'background:' + bg + ';color:' + CONFIG.fgColor + ';' +
-        'font:500 11px/1 "Roboto","Arial",sans-serif;' +
-        'box-shadow:0 1px 3px rgba(0,0,0,.35);' +
-        '-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);' +
+        'padding:3px 7px 3px 5px;box-sizing:border-box;' +
+        'border-radius:4px;' +
+        'background:' + CONFIG.bgColor + ';color:' + CONFIG.fgColor + ';' +
+        'font:500 12px/16px "Roboto","Arial",sans-serif;letter-spacing:.2px;white-space:nowrap;' +
         'pointer-events:none;' +
       '}' +
-      // Drop-shadow keeps the white clock readable now that the background is see-through.
-      '.wl-badge svg{width:15px;height:15px;display:block;fill:' + CONFIG.fgColor + ';' +
-        'filter:drop-shadow(0 1px 1.5px rgba(0,0,0,.55));}' +
-      '.wl-badge--label{padding:0 7px 0 5px;}' +
-      '.wl-badge-text{white-space:nowrap;text-shadow:0 1px 1.5px rgba(0,0,0,.55);}';
+      '.wl-badge svg{width:16px;height:16px;flex:none;display:block;fill:' + CONFIG.iconColor + ';}' +
+      // Icon-only: small thumbnails, or showLabel 'never'.
+      '.wl-badge--icon,.wl-badge:not(:has(.wl-badge-text)){padding:2px;}' +
+      '.wl-badge--icon .wl-badge-text{display:none;}' +
+      // Shorts cards carry YouTube's own top-left chip ("New" etc.) inside the same link: stack below it.
+      (CONFIG.badgeCorner.startsWith('top') ? 'a:has(> .shortsLockupViewModelHostBadge) > .wl-badge{top:32px;}' : '') +
+      // Hover button: round, like YouTube's own preview buttons; hidden until the card is hovered.
+      '.wl-btn{' +
+        'position:absolute;top:8px;right:8px;z-index:61;' +
+        'width:36px;height:36px;padding:0;margin:0;border:0;border-radius:50%;' +
+        'display:flex;align-items:center;justify-content:center;' +
+        'background:rgba(0,0,0,.6);cursor:pointer;' +
+        'opacity:0;pointer-events:none;transition:opacity .15s,background-color .15s;' +
+      '}' +
+      // (The preview only plays while a card is hovered, so its button shows whenever it's active.)
+      ':is(' + CARDS + '):hover .wl-btn,a:hover > .wl-btn,ytd-video-preview[active] .wl-btn,.wl-btn:focus-visible{opacity:1;pointer-events:auto;}' +
+      '.wl-btn:hover{background:rgba(0,0,0,.85);}' +
+      '.wl-btn svg{width:20px;height:20px;fill:#fff;}' +
+      '.wl-btn .wl-btn-on,.wl-btn--on .wl-btn-add{display:none;}' +
+      '.wl-btn--on .wl-btn-on{display:block;fill:' + CONFIG.iconColor + ';}' +
+      '.wl-btn--preview{right:56px;}' + // left of the inline preview's mute button
+      '.wl-btn--sm{width:28px;height:28px;top:4px;right:4px;}' +
+      '.wl-btn--sm svg{width:16px;height:16px;}' +
+      '.wl-btn--busy{opacity:.5 !important;cursor:progress;}' +
+      // Where YouTube still draws its own hover "Watch later" button (channel pages), it creates
+      // it on hover inside the same link: step aside for it.
+      'a:has(yt-thumbnail-hover-overlay-toggle-actions-view-model, ytd-thumbnail-overlay-toggle-button-renderer) > .wl-btn{display:none;}';
     if (typeof GM_addStyle === 'function') GM_addStyle(css);
     else { const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s); }
   }
@@ -653,6 +795,7 @@
       GM_registerMenuCommand('Clear cached list', () => {
         try { GM_setValue(cacheKey(), ''); } catch (e) {}
         wlSet = new Set();
+        entryIds = new Map();
         clearAllBadges();
         scheduleMark();
       });
@@ -667,15 +810,14 @@
     registerMenu();
     ensureWatchLater(false);
 
+    // New cards, and recycled ones (YouTube swaps the href on existing nodes as you scroll).
     const mo = new MutationObserver(() => scheduleMark());
-    mo.observe(document.documentElement, { childList: true, subtree: true });
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
 
     // YouTube is a SPA: re-check on navigation and data updates.
     window.addEventListener('yt-navigate-finish', () => { ensureWatchLater(false); scheduleMark(); });
     window.addEventListener('yt-page-data-updated', () => scheduleMark());
-
-    // Safety net for recycled/virtualized list nodes.
-    setInterval(scheduleMark, 2000);
+    window.addEventListener('resize', () => scheduleMark());
 
     scheduleMark();
   }
